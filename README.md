@@ -1,118 +1,192 @@
 # ESP32-CAM (AI-Thinker) + GC2145 — Captura acionada por BLE
 
-Firmware para ESP32-CAM que grava imagens ao receber um comando via BLE (de um relógio/smartwatch), converte os frames para JPEG por software e envia para um backend via Wi-Fi, com buffer offline no microSD caso a rede caia.
+Firmware da câmera do Safe Evidence. Quando o relógio manda o comando por
+BLE, a câmera captura frames, converte para JPEG por software e envia cada
+um para o backend por **HTTPS**, autenticada com a chave do dispositivo. Ao
+receber o comando de parar, avisa o backend, que monta o vídeo, calcula o
+hash SHA-256 e guarda a evidência. Se a rede cair no meio, os frames vão para
+o microSD e são reenviados depois.
+
+```
+Relógio ──BLE──> ESP32-CAM ──HTTPS──> Backend (/api/captura/*)
+```
 
 ## Hardware necessário
 
-- Placa **AI-Thinker ESP32-CAM** com sensor **GC2145** (PID `0x2145`)
-- Cartão microSD (opcional — o sistema funciona sem ele, só perde o buffer offline)
-- Adaptador FTDI/USB-serial para gravar o firmware (a placa não tem USB própria)
-- Fonte externa 5V (recomendado) se for usar Wi-Fi + câmera + BLE juntos por muito tempo
+- Placa **AI-Thinker ESP32-CAM** com sensor **GC2145** (PID `0x2145`) e PSRAM
+- Adaptador FTDI/USB-serial **ou** a base **ESP32-CAM-MB** (com USB) para gravar
+  o firmware; a placa sozinha não tem USB
+- Cartão microSD (opcional: sem ele o sistema funciona, só perde o buffer offline)
+- Fonte 5V estável (recomendado): Wi-Fi + câmera + BLE juntos puxam bastante
+  corrente, e fonte fraca causa reinícios
 
-## 1. Instalar a Arduino IDE e o suporte a ESP32
+## 1. Arduino IDE e suporte a ESP32
 
-1. Baixe e instale a [Arduino IDE](https://www.arduino.cc/en/software) (versão 1.8.x ou 2.x).
-2. Em **Arquivo > Preferências**, cole esta URL em "URLs Adicionais para Gerenciadores de Placas":
+1. Instale a [Arduino IDE](https://www.arduino.cc/en/software) (1.8.x ou 2.x).
+2. Em **Arquivo > Preferências**, cole em "URLs Adicionais para Gerenciadores de Placas":
    ```
    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
    ```
-3. Vá em **Ferramentas > Placa > Gerenciador de Placas**, procure por `esp32` (Espressif Systems) e instale.
+3. Em **Ferramentas > Placa > Gerenciador de Placas**, procure `esp32`
+   (Espressif Systems) e instale a versão **2.0.17**. O projeto foi testado
+   nela; a 3.x muda APIs usadas aqui.
 
-## 2. Instalar as bibliotecas necessárias
+## 2. Bibliotecas
 
-Em **Ferramentas > Gerenciar Bibliotecas** (ou `Ctrl+Shift+I`), instale:
+Em **Ferramentas > Gerenciar Bibliotecas** (`Ctrl+Shift+I`), instale:
 
-- **NimBLE-Arduino** (autor: **h2zero**)
-- **WiFiManager** (autor: **tzapu**)
+- **NimBLE-Arduino** (h2zero), versão **2.x**
+- **WiFiManager** (tzapu)
 
-`SD_MMC` e `img_converters.h` já vêm com o core do ESP32 — não precisa instalar nada à parte.
+`WiFiClientSecure`, `HTTPClient`, `SD_MMC` e `img_converters.h` já vêm com o
+core do ESP32.
 
-## 3. ⚠️ Editar o `nimconfig.h` da biblioteca NimBLE (obrigatório)
+## 3. ⚠️ Editar o `nimconfig.h` da NimBLE (obrigatório)
 
-Sem esse passo, a compilação **vai falhar** com o erro:
+Sem esse passo, a compilação **falha** com:
 
 ```
 region `iram0_0_seg' overflowed by N bytes
 ```
 
-Isso acontece porque, por padrão, a NimBLE-Arduino compila suporte para papéis (roles) BLE que este projeto não usa (central e observer), e isso não cabe no espaço de memória interna (IRAM) do ESP32 junto com Wi-Fi + câmera.
+Por padrão a NimBLE-Arduino inclui os papéis BLE *central* e *observer*, que a
+câmera não usa, e eles não cabem na memória interna (IRAM) junto com Wi-Fi +
+câmera.
 
-**Passo a passo:**
-
-1. Localize o arquivo `nimconfig.h` dentro da pasta onde a biblioteca foi instalada, por exemplo:
+1. Abra o arquivo (ajuste o caminho se a pasta Arduino for outra):
    ```
    Documentos\Arduino\libraries\NimBLE-Arduino\src\nimconfig.h
    ```
-2. Abra esse arquivo em um editor de texto (Bloco de Notas, VS Code, etc.).
-3. Encontre a linha:
-   ```cpp
-   // #define CONFIG_BT_NIMBLE_ROLE_CENTRAL 0
-   ```
-   Remova as duas barras (`//`) no início, deixando:
+2. Tire o `//` do começo destas duas linhas:
    ```cpp
    #define CONFIG_BT_NIMBLE_ROLE_CENTRAL 0
-   ```
-4. Logo abaixo, faça o mesmo com:
-   ```cpp
-   // #define CONFIG_BT_NIMBLE_ROLE_OBSERVER 0
-   ```
-   deixando:
-   ```cpp
    #define CONFIG_BT_NIMBLE_ROLE_OBSERVER 0
    ```
-5. **Não mexa** em `CONFIG_BT_NIMBLE_ROLE_PERIPHERAL` nem em `CONFIG_BT_NIMBLE_ROLE_BROADCASTER` — este projeto usa as duas (servidor BLE + advertising).
-6. Salve o arquivo, **feche e reabra a Arduino IDE** (para forçar a recompilação da biblioteca do zero) e compile o sketch novamente.
+3. **Não mexa** em `CONFIG_BT_NIMBLE_ROLE_PERIPHERAL` nem em
+   `CONFIG_BT_NIMBLE_ROLE_BROADCASTER`: a câmera usa os dois.
+4. Salve, **feche e reabra a Arduino IDE** e compile de novo.
 
-> Por que editar a biblioteca e não o próprio sketch? Colocar essas mesmas definições no arquivo `.ino`, antes do `#include <NimBLEDevice.h>`, **não tem efeito** nesta versão da biblioteca — o único jeito que realmente funciona é editando o `nimconfig.h` diretamente.
+> **Relógio no mesmo computador:** o firmware do relógio precisa do contrário
+> (essas duas linhas **comentadas**). Como a biblioteca é uma só, alterne o
+> `nimconfig.h` antes de compilar cada um.
+>
+> Colocar essas definições no `.ino`, antes do `#include <NimBLEDevice.h>`,
+> **não tem efeito** nesta versão da biblioteca.
 
-## 4. Selecionar a placa correta
+## 4. Configurar o firmware
 
-Em **Ferramentas**, configure:
+No começo do `esp32cam.ino`, na seção `--- Backend ---`:
+
+| Linha | O que colocar |
+| --- | --- |
+| `SERVER_BASE` | endereço do backend, com `https://` e sem barra no fim |
+| `DEVICE_ID` | id do dispositivo cadastrado no backend (ex.: `esp32cam-01`) |
+| `DEVICE_KEY` | chave secreta do dispositivo (ver abaixo) |
+
+**Chave do dispositivo:** o backend recusa frames sem ela (erro `401`). Ela é
+gerada no backend com `npm run chave-dispositivo -- esp32cam-01` e passada em
+particular.
+
+- **Antes de gravar a placa:** cole a chave no lugar de `COLE_A_CHAVE_AQUI`.
+- **Antes de fazer commit:** volte a linha para `COLE_A_CHAVE_AQUI`. A chave
+  **não pode ir para o GitHub**. Confira com `git diff` antes do commit.
+
+Gerar uma chave nova invalida a anterior: a câmera precisa ser gravada de
+novo com a nova.
+
+Os UUIDs do BLE (`SERVICE_UUID` e `CHARACTERISTIC_UUID`) têm que ser iguais
+aos do firmware do relógio.
+
+## 5. Selecionar a placa
+
+Em **Ferramentas**:
 
 | Opção | Valor |
 |---|---|
 | Placa | AI Thinker ESP32-CAM |
 | Upload Speed | 115200 |
-| Porta | a porta COM onde o adaptador FTDI aparece |
+| Porta | a porta COM do adaptador |
 
-## 5. Fazer o upload do firmware
+A placa "AI Thinker ESP32-CAM" já habilita a PSRAM; ao ligar, o Serial
+Monitor deve mostrar `PSRAM encontrada - capturando em alta resolucao`.
 
-1. Conecte o adaptador FTDI/USB-serial à ESP32-CAM.
-2. Ligue o pino **GPIO0** ao **GND** (modo de gravação) — em várias placas isso é feito com um jumper.
-3. Clique em **Carregar** (seta →) na Arduino IDE.
-4. Se pedir, pressione o botão **RESET** da placa no momento em que a IDE mostrar "Connecting...".
-5. Depois que o upload terminar, **remova o jumper GPIO0-GND** e pressione RESET de novo para rodar o firmware normalmente.
+## 6. Gravar o firmware
 
-## 6. Primeira configuração de Wi-Fi
+**Com adaptador FTDI:**
 
-Na primeira vez que a placa ligar (ou após um comando de reset de Wi-Fi via BLE), ela vai abrir uma rede própria chamada **"Config-Dispositivo"**:
+1. Ligue o **GPIO0** ao **GND** (modo de gravação).
+2. Clique em **Carregar** na Arduino IDE. Se ficar em `Connecting...`,
+   pressione o **RESET** da placa.
+3. Terminado o upload, **tire o jumper GPIO0-GND** e pressione RESET.
+
+**Com a base ESP32-CAM-MB:** encaixe a placa na base, conecte o USB e clique
+em **Carregar**. Se não conectar, segure o botão **IO0** da base, aperte e
+solte o **RST**, e solte o IO0.
+
+> Se estiver usando a Arduino IDE 2, **feche o sketch antes de editar o
+> `.ino` por fora** (VS Code, Git, etc.). A IDE salva sozinha a versão que
+> está aberta e pode desfazer as mudanças feitas fora dela.
+
+## 7. Primeira configuração de Wi-Fi
+
+Na primeira vez que liga (ou depois do comando de reset de Wi-Fi), a placa
+abre uma rede própria chamada **"Config-Dispositivo"**:
 
 1. Conecte o celular nessa rede.
-2. Uma página deve abrir sozinha (ou acesse `192.168.4.1` no navegador).
-3. Escolha a rede Wi-Fi de casa e digite a senha.
+2. A página de configuração abre sozinha (ou acesse `192.168.4.1`).
+3. Escolha a rede Wi-Fi e digite a senha.
 
-As credenciais ficam salvas na flash do próprio ESP32 — não passam pelo backend, e continuam salvas mesmo desligando a placa.
+As credenciais ficam só na flash do ESP32: não passam pelo backend e
+continuam salvas depois de desligar. O portal fica aberto por 3 minutos
+(`WIFI_CONFIG_TIMEOUT_S`) e depois tenta de novo.
 
-## 7. Rodando sem o computador (bateria)
+O nome da rede e o nome BLE (`Dispositivo-01`) são genéricos de propósito,
+para não identificar o produto.
 
-O firmware fica gravado permanentemente na flash. Basta ligar a placa (USB ou bateria 5V regulada) que ela roda sozinha, reconecta no Wi-Fi salvo e fica esperando o comando BLE do relógio — não precisa estar conectada ao computador.
+## 8. Funcionamento
+
+O firmware fica gravado na flash: basta ligar a placa (USB ou fonte 5V) que
+ela conecta no Wi-Fi salvo e espera o relógio.
+
+| Byte escrito pelo relógio na characteristic | Ação |
+|---|---|
+| `0x01` | inicia a gravação (abre uma sessão `DEVICE_ID-<millis>`) |
+| `0x00` | para a gravação e avisa o backend para montar o vídeo |
+| `0x02` | apaga o Wi-Fi salvo e reabre o portal de configuração |
+
+O relógio só envia `0x01` e `0x00`. O `0x02` pode ser enviado por um app de
+BLE no celular (ex.: nRF Connect), escrevendo `02` na characteristic.
+
+- **Resolução:** VGA 640×480 com PSRAM (QVGA 320×240 sem), JPEG com qualidade 80.
+- **Taxa de frames:** a câmera captura o mais rápido que consegue, até 10 fps.
+  Na prática fica em torno de 1 frame por segundo, porque a conversão para
+  JPEG é por software. O backend usa o horário de captura de cada frame para
+  o vídeo sair na velocidade real.
+- **Relógio desconectado no meio da gravação:** a câmera para, avisa o backend
+  (o trecho gravado vira vídeo) e, quando o relógio reconecta ainda
+  gravando, começa uma sessão nova.
+- **Wi-Fi caiu:** os frames vão para o microSD (pasta `/pending`) e são
+  reenviados a cada 10 s quando a rede volta, fora dos momentos de gravação.
 
 ## Problemas comuns
 
 | Sintoma | Causa provável | Solução |
 |---|---|---|
-| `NimBLEDevice.h: No such file or directory` | Biblioteca NimBLE-Arduino não instalada | Instalar via Gerenciador de Bibliotecas (passo 2) |
-| `region iram0_0_seg overflowed by N bytes` | Papéis BLE não usados ainda ativos na lib | Editar `nimconfig.h` (passo 3) |
-| `sdmmc_init_ocr ... returned 0x107` / `Falha ao montar o cartão SD` | Sem cartão SD, cartão mal encaixado, ou cartão incompatível | Ignorar se não for usar SD — o sistema funciona normalmente sem buffer offline. Se quiser usar, testar cartão pequeno (≤8GB) formatado em FAT32 e reencaixar bem |
-| Câmera não inicializa | Pinout errado ou placa selecionada errada | Confirmar que a placa selecionada é "AI Thinker ESP32-CAM" |
-| `JPEG format is not supported on this sensor` | Sensor GC2145 não suporta JPEG em hardware | Não usar `PIXFORMAT_JPEG` — o firmware já usa RGB565 + conversão por software (`frame2jpg`) |
+| `NimBLEDevice.h: No such file or directory` | NimBLE-Arduino não instalada | Instalar (passo 2) |
+| `region iram0_0_seg overflowed by N bytes` | Papéis BLE não usados ativos na lib | Editar `nimconfig.h` (passo 3) |
+| `Codigo HTTP: -1` / `Erro no envio. Código HTTP: -1` | Sem conexão com o backend: `SERVER_BASE` errado, backend desligado, ou falha no HTTPS | Abrir `SERVER_BASE/health` no navegador; conferir se o servidor está ligado |
+| `Código HTTP: 401` | `DEVICE_KEY` errada, ainda `COLE_A_CHAVE_AQUI`, ou chave trocada no backend | Colar a chave atual e gravar de novo |
+| `Código HTTP: 403` | `DEVICE_ID` diferente do dispositivo da chave | Conferir `DEVICE_ID` |
+| Placa reinicia sozinha | Fonte fraca | Usar fonte 5V estável |
+| `sdmmc_init_ocr ... returned 0x107` / `Falha ao montar o cartão SD` | Sem cartão, mal encaixado ou incompatível | Ignorar se não for usar SD. Para usar: cartão ≤ 8 GB, FAT32, bem encaixado |
+| Câmera não inicializa | Placa errada selecionada | Selecionar "AI Thinker ESP32-CAM" |
+| `JPEG format is not supported on this sensor` | GC2145 não faz JPEG em hardware | Não usar `PIXFORMAT_JPEG`; o firmware já usa RGB565 + `frame2jpg` |
 
-## Como funciona o comando BLE
+## Serial Monitor (115200)
 
-O relógio escreve 1 byte na characteristic BLE configurada:
+Mensagens úteis para testar, todas só no Serial (nada visível na placa):
 
-| Byte | Ação |
-|---|---|
-| `0x01` | Inicia a gravação |
-| `0x00` | Para a gravação |
-| `0x02` | Reseta o Wi-Fi salvo e reabre o portal de configuração |
+- `>> BLE: comando START recebido. Iniciando gravação...`
+- `Frame N: ... bytes | captura+conversao ... ms | envio ... ms` (tamanho e tempo de cada frame)
+- `>> BLE: comando STOP recebido. Gravação encerrada.`
+- `Notificacao de encerramento enviada. Codigo HTTP: 202` (backend recebeu e vai montar o vídeo)
