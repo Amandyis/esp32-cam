@@ -353,6 +353,34 @@ void setup() {
   Serial.println("Sistema pronto. Aguardando comando BLE do relógio...");
 }
 
+// Faz uma varredura de redes ANTES de abrir o portal e imprime no Serial o
+// que o ESP32 realmente enxerga (nome, sinal em dBm e canal). Serve para
+// comparar com a lista do celular quando uma rede não aparece no portal:
+//  - rede que não aparece nem aqui: provavelmente é só 5 GHz (o ESP32 só
+//    funciona em 2.4 GHz) ou o sinal não chega na antena da placa;
+//  - rede que aparece aqui com sinal abaixo de ~-80 dBm: chega fraca demais e
+//    vai aparecer/sumir entre uma varredura e outra no portal.
+// A varredura é mais lenta que o padrão (500 ms por canal) para pegar
+// roteadores que mandam beacon com pouca frequência.
+void diagnosticarRedesWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  Serial.println("Procurando redes Wi-Fi (só 2.4 GHz)...");
+  int n = WiFi.scanNetworks(false, true, false, 500);
+  if (n <= 0) {
+    Serial.println("  Nenhuma rede encontrada. Confira a antena da placa e a fonte de alimentação.");
+  } else {
+    for (int i = 0; i < n; i++) {
+      Serial.printf("  %2d. %-32s %4d dBm  canal %2d\n", i + 1,
+                    WiFi.SSID(i).length() ? WiFi.SSID(i).c_str() : "(rede oculta)",
+                    WiFi.RSSI(i), WiFi.channel(i));
+    }
+  }
+  WiFi.scanDelete();
+}
+
 void connectWiFi() {
   WiFiManager wm;
 
@@ -361,6 +389,13 @@ void connectWiFi() {
   // wm.resetSettings();
 
   wm.setConfigPortalTimeout(WIFI_CONFIG_TIMEOUT_S);
+
+  // Mostra a força do sinal (%) de cada rede na lista do portal. Ajuda a
+  // perceber quando a placa está ouvindo mal (antena) em vez de achar que a
+  // rede "sumiu".
+  wm.setScanDispPerc(true);
+
+  diagnosticarRedesWiFi();
 
   Serial.println("Tentando conectar ao Wi-Fi salvo...");
   Serial.println("Se não conseguir, abrirá o portal de configuração:");
