@@ -1,107 +1,49 @@
 /*
- * ESP32-CAM (AI-Thinker) - sensor GC2145
- * Captura acionada por comando BLE (relógio) + envio via HTTP (Wi-Fi)
- * com buffer offline no microSD, e conversão de imagem RGB565 -> JPEG
- * por software (o GC2145 não tem compressão JPEG em hardware).
+ * Safe Evidence - ESP32-CAM (AI-Thinker)
  *
- * ---------------------------------------------------------------------
- * POR QUE RGB565 NA CAPTURA E JPEG SÓ DEPOIS (POR SOFTWARE)?
- * ---------------------------------------------------------------------
- * O OV2640 (comum nas ESP32-CAM) tem um compressor JPEG embutido no
- * próprio sensor: você pede PIXFORMAT_JPEG e ele já entrega o frame
- * comprimido.
+ * Grava quando o relógio manda START por BLE e envia os frames JPEG ao
+ * backend por HTTPS, em lotes de até 3 por requisição. Sem rede, o frame vai
+ * para o microSD e é reenviado depois; o aviso de fim da sessão só sai quando o SD não tem mais frames
+ * dela, para o backend montar o vídeo completo.
  *
- * O GC2145 NÃO tem esse hardware de compressão. Se você configurar
- * pixel_format = PIXFORMAT_JPEG com esse sensor, o driver esp32-camera
- * detecta a incompatibilidade e retorna o erro:
- *   "JPEG format is not supported on this sensor"
- *
- * A solução é capturar em um formato RAW que o GC2145 realmente suporta
- * (RGB565) e converter esse frame para JPEG depois, via software, usando
- * a função frame2jpg() da própria biblioteca esp32-camera (declarada em
- * "img_converters.h"). Essa conversão roda na CPU do ESP32 (usa libjpeg
- * internamente) - por isso é mais lenta e consome mais RAM/tempo que a
- * compressão via hardware do OV2640, mas é o único caminho compatível
- * com sensores RAW como o GC2145.
- *
- * Bibliotecas necessárias (instalar via Library Manager da Arduino IDE):
- *   - NimBLE-Arduino (por h2zero)  - BLE leve, para não estourar RAM junto com Wi-Fi/câmera
- *   - WiFiManager (por tzapu)      - portal cativo para configurar o Wi-Fi da usuária
- *   (SD_MMC e img_converters.h já vêm incluídos no core ESP32/esp32-camera, não precisa instalar)
- *
- * Fluxo:
- *  1. Ao ligar, tenta conectar no Wi-Fi salvo. Se não tiver rede salva (ou
- *     falhar), abre um portal de configuração: o dispositivo cria uma rede
- *     Wi-Fi própria, a pessoa conecta o celular nela, escolhe a rede de casa
- *     e digita a senha numa página simples. As credenciais ficam salvas só
- *     na flash do próprio ESP32 - nunca passam pelo backend.
- *  2. Inicializa a câmera em RGB565 (QVGA) e confirma o PID do sensor (GC2145)
- *  3. Monta o cartão microSD (modo 1-bit, compatível com o AI-Thinker)
- *  4. Sobe um servidor BLE com uma characteristic gravável
- *  5. O relógio (já programado para detectar o "segurar 1,5s") conecta via
- *     BLE e escreve um comando de 1 byte:
- *        0x01 = INICIAR gravação
- *        0x00 = PARAR gravação
- *        0x02 = RESET do Wi-Fi salvo (útil ao reatribuir o dispositivo a
- *               outra usuária) - reinicia e abre o portal de configuração
- *  6. Enquanto "gravando" = true, captura frames continuamente. Cada frame:
- *       - é capturado em RGB565 (esp_camera_fb_get)
- *       - é convertido para JPEG por software (frame2jpg)
- *       - se o Wi-Fi estiver OK e o envio funcionar -> o JPEG vai direto pro backend
- *       - se falhar ou não tiver rede -> o JPEG é salvo no microSD (pasta /pending),
- *         desde que haja espaço livre suficiente (uma margem de 2MB é
- *         mantida reservada; se o cartão encher, o frame é descartado e um
- *         aviso único é impresso no Serial, sem travar o dispositivo)
- *  7. Quando não está gravando e o Wi-Fi está disponível, o dispositivo
- *     varre periodicamente a pasta /pending e reenvia os frames perdidos,
- *     apagando do SD só depois da confirmação de sucesso do backend
+ * Bibliotecas (Library Manager): NimBLE-Arduino (h2zero) e WiFiManager (tzapu).
+ * A chave do dispositivo fica em segredos.h (modelo: segredos.exemplo.h).
  */
 
 #include "esp_camera.h"
-#include "img_converters.h" // necessário para frame2jpg() - conversão RGB565 -> JPEG por software
+#include "img_converters.h"
 #include <WiFi.h>
+#include "esp_wifi.h"
 #include <HTTPClient.h>
-#include <WiFiClientSecure.h>  // [HTTPS] conexão cifrada com o backend na nuvem
-
-// NOTA sobre erro "region `iram0_0_seg' overflowed":
-// Definir CONFIG_BT_NIMBLE_* aqui antes do include NÃO tem efeito nesta
-// versão da NimBLE-Arduino. Para reduzir o footprint de código da pilha
-// BLE (e resolver overflow de IRAM), edite diretamente o arquivo
-// nimconfig.h dentro da pasta da biblioteca instalada, por exemplo:
-//   Documentos\Arduino\libraries\NimBLE-Arduino\src\nimconfig.h
-// Ajustes recomendados nesse arquivo: CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1,
-// CONFIG_BT_NIMBLE_ROLE_CENTRAL_DISABLED, CONFIG_BT_NIMBLE_ROLE_OBSERVER_DISABLED,
-// CONFIG_BT_NIMBLE_EXT_ADV=0, CONFIG_BT_NIMBLE_LOG_LEVEL=0.
+#include <WiFiClientSecure.h>
+// Se der "iram0_0_seg overflowed", reduza a NimBLE no nimconfig.h da biblioteca
+// (MAX_CONNECTIONS=1, sem papéis central/observer, LOG_LEVEL=0).
 #include <NimBLEDevice.h>
-#include <WiFiManager.h>   // by tzapu - instalar via Library Manager
-#include "SD_MMC.h"        // já vem com o core ESP32 - buffer offline no cartão SD
-
-// ==================== CONFIGURAÇÕES DO USUÁRIO ====================
-
-// --- Wi-Fi ---
-// Não colocamos SSID/senha fixos aqui: cada usuária configura a própria rede
-// na primeira vez que liga o dispositivo, através do portal de configuração
-// (ver connectWiFi()). As credenciais ficam salvas apenas na memória flash
-// do próprio ESP32 - nunca passam pelo backend.
-#define WIFI_CONFIG_AP_NAME "Config-Dispositivo"   // nome genérico, não identifica o produto
-#define WIFI_CONFIG_TIMEOUT_S 180                  // tempo (s) que o portal fica aberto antes de tentar de novo
-
-// --- Backend ---
-// [HTTPS] O backend agora roda na AWS, com HTTPS. Troque só o domínio abaixo.
-#define SERVER_BASE "https://safeevidence.duckdns.org"
-const char* SERVER_URL = SERVER_BASE "/api/captura/upload"; // endpoint que recebe as imagens
-const char* DEVICE_ID  = "esp32cam-01";
-// [CHAVE] A chave secreta do dispositivo (DEVICE_KEY) fica em "segredos.h",
-// que NÃO vai para o Git. Para montar o seu: copie "segredos.exemplo.h" para
-// "segredos.h" e cole a chave gerada no backend com
-//   npm run chave-dispositivo -- esp32cam-01
+#include <WiFiManager.h>
+#include "SD_MMC.h"
 #include "segredos.h"
-const char* SERVER_URL_ENCERRAR = SERVER_BASE "/api/captura/sessao/encerrar";
 
-// [HTTPS] Certificados raiz do Let's Encrypt (quem emite o certificado do
-// backend). Com eles a câmera confere que está falando com o servidor
-// verdadeiro antes de mandar qualquer imagem. Válidos até 2035 e 2040.
-const char* ROOT_CA = R"CERTS(
+// ==================== CONFIGURAÇÃO ====================
+
+// A rede é escolhida pela usuária no portal de configuração e fica só na flash da placa.
+#define NOME_REDE_CONFIGURACAO "Config-Dispositivo"
+#define TEMPO_PORTAL_CONFIGURACAO_S 180
+// Varredura mais lenta que o padrão para pegar roteadores que mandam beacon com pouca frequência.
+#define TEMPO_VARREDURA_POR_CANAL_MS 500
+#define SINAL_FRACO_DBM -80
+
+#define HOST_BACKEND "safeevidence.duckdns.org"
+#define PORTA_HTTPS 443
+#define ENDERECO_BACKEND "https://" HOST_BACKEND
+// O handshake TLS no hotspot leva de 5 a 15 s; a conexão fica aberta antes do START.
+#define INTERVALO_AQUECIMENTO_CONEXAO_MS 30000
+const char *URL_UPLOAD_LOTE = ENDERECO_BACKEND "/api/captura/upload-lote";
+const char *URL_ENCERRAR_SESSAO = ENDERECO_BACKEND "/api/captura/sessao/encerrar";
+const char *ID_DISPOSITIVO = "esp32cam-01";
+
+// Raízes do Let's Encrypt (válidas até 2035 e 2040): a câmera só envia
+// imagens depois de confirmar que fala com o backend verdadeiro.
+const char *CERTIFICADOS_RAIZ = R"CERTS(
 -----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
 TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
@@ -149,277 +91,327 @@ tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
 -----END CERTIFICATE-----
 )CERTS";
 
-// --- BLE ---
-#define BLE_DEVICE_NAME     "Dispositivo-01"   // nome genérico, não identifica o produto
-#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
-#define CHARACTERISTIC_UUID "abcd1234-ab12-cd34-ef56-1234567890ab"
 
-#define CMD_STOP        0x00
-#define CMD_START       0x01
-#define CMD_RESET_WIFI  0x02   // apaga a rede salva e reabre o portal de configuração
+#define NOME_BLE "Dispositivo-01"
+#define UUID_SERVICO "12345678-1234-1234-1234-1234567890ab"
+#define UUID_CARACTERISTICA "abcd1234-ab12-cd34-ef56-1234567890ab"
 
-// --- Comportamento da captura ---
-// Intervalo MÍNIMO entre frames. Na prática a taxa real é limitada pelo
-// tempo de capturar + converter + enviar cada frame (ver o log
-// "Frame N: ... ms" no Serial). Com 100 ms a placa captura o mais rápido
-// que conseguir, até no máximo 10 fps.
+#define COMANDO_PARAR 0x00
+#define COMANDO_INICIAR 0x01
+#define COMANDO_APAGAR_WIFI 0x02
+
 #define INTERVALO_FRAMES_MS 100
 
-// --- Resolução ---
-// VGA (640x480) = 4x mais pixels que o QVGA anterior (320x240).
-// Um frame RGB565 em VGA ocupa ~600 KB, então EXIGE PSRAM (a AI-Thinker
-// tem 4 MB). Sem PSRAM, o setupCamera() cai automaticamente para QVGA.
-// Outras opções do GC2145: FRAMESIZE_HVGA (480x320), FRAMESIZE_SVGA
-// (800x600) - quanto maior, mais lenta a conversão e menos fps.
-#define FRAME_SIZE_COM_PSRAM FRAMESIZE_VGA
-#define FRAME_SIZE_SEM_PSRAM FRAMESIZE_QVGA
+// A captura roda numa tarefa própria e entrega os frames ao loop() por esta
+// fila. Quando ela enche (rede lenta), o frame vai direto para o SD.
+#define TAMANHO_FILA_COM_PSRAM 10
+// Sem PSRAM os frames ocupam a RAM interna, que o TLS também precisa.
+#define TAMANHO_FILA_SEM_PSRAM 3
+#define PILHA_TAREFA_CAPTURA 8192
+#define PRIORIDADE_TAREFA_CAPTURA 2
+#define NUCLEO_TAREFA_CAPTURA 1
 
-// --- Conversão de imagem (GC2145: RGB565 na captura, JPEG por software) ---
-// ATENÇÃO: a escala do frame2jpg() é 1-100, com MAIOR = MELHOR (como o
-// "qualidade" de um editor de imagem). É o contrário do jpeg_quality da
-// camera_config_t (0-63, menor = melhor), que só vale para sensores com
-// JPEG em hardware (OV2640). O valor 12 que estava aqui era interpretado
-// como qualidade 12/100 - por isso o vídeo saía borrado e "quadriculado".
-#define JPEG_QUALIDADE_SW 80
+// OV2640 entrega JPEG pronto (0-63, menor = melhor). O GC2145 só entrega RGB565
+// e o JPEG é feito por software (1-100, maior = melhor).
+#define PID_OV2640 0x26
+#define PID_GC2145 0x2145
+#define RESOLUCAO_JPEG_HARDWARE FRAMESIZE_VGA
+// 15 deixa o frame uns 20-30% menor que 12, com perda pequena de detalhe em VGA.
+#define QUALIDADE_JPEG_HARDWARE 15
+#define RESOLUCAO_RGB_COM_PSRAM FRAMESIZE_HVGA
+#define RESOLUCAO_RGB_SEM_PSRAM FRAMESIZE_QVGA
+#define QUALIDADE_JPEG_SOFTWARE 80
+#define FREQUENCIA_XCLK_HZ 20000000
 
-// --- Buffer offline no microSD ---
-#define SD_PENDING_DIR      "/pending"  // pasta onde ficam os frames ainda não enviados
-#define SYNC_INTERVAL_MS    10000       // a cada quanto tempo tenta reenviar pendentes (com Wi-Fi ok)
-#define SYNC_MAX_POR_CICLO  5           // no máximo N arquivos por tentativa de sincronização
-#define SD_MARGEM_MINIMA_BYTES (2UL * 1024 * 1024) // reserva 2MB livres como margem de segurança
+#define PASTA_PENDENTES "/pending"
+#define INTERVALO_SINCRONIZACAO_MS 10000
+// Vários frames por POST: com a rede do celular, cada requisição a menos poupa
+// uma ida e volta. O backend aceita até 20 por lote.
+// 3 frames (~50-75 KB): lotes maiores caíam no meio do envio pelo hotspot e
+// cada falha mandava o lote inteiro de volta para o SD.
+#define MAX_FRAMES_POR_LOTE 3
+#define MAX_LOTES_REENVIADOS_POR_CICLO 4
+#define MAX_SESSOES_AGUARDANDO_FIM 5
+// Margem livre no cartão: escrever com ele cheio pode corromper o sistema de arquivos.
+#define MARGEM_LIVRE_SD_BYTES (2UL * 1024 * 1024)
+#define TENTATIVAS_AVISO_FIM 3
+#define ESPERA_ENTRE_TENTATIVAS_MS 500
+#define BYTES_POR_MB (1024 * 1024)
+#define ESPERA_ANTES_DE_REINICIAR_MS 3000
+#define VELOCIDADE_SERIAL 115200
 
-// ==================== PINOUT DA CÂMERA (AI-Thinker) ====================
+// Pinos da câmera na placa AI-Thinker
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
 
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
+// ==================== ESTADO ====================
 
-// ==================== VARIÁVEIS DE ESTADO ====================
+volatile bool gravando = false;
+String idSessaoAtual = "";
+// A tarefa de captura identifica a sessão por este número (leitura atômica),
+// e não pela String, que o BLE altera em outra tarefa.
+volatile unsigned long inicioSessaoMs = 0;
 
-volatile bool recording = false;   // estado atual: gravando ou não (controlado via BLE)
-String currentSessionId = "";
-// [STOP] O aviso de encerramento ao backend é feito no loop(), não dentro do
-// callback do BLE: a conexão HTTPS precisa de mais memória de pilha do que a
-// tarefa do BLE tem, e fazer isso lá reiniciava a placa.
-volatile bool encerramentoPendente = false;
-String sessaoParaEncerrar = "";
-int frameIndex = 0;
-unsigned long lastFrameTime = 0;
-unsigned long sessionStartMs = 0;   // millis() do START - base do tempo de captura de cada frame
+struct FrameCapturado {
+  uint8_t *jpeg;
+  size_t tamanho;
+  unsigned long inicioSessaoMs;
+  int indice;
+  unsigned long tCapturaMs;
+};
 
-// Conexão HTTP reaproveitada entre os envios de frame (keep-alive): evita
-// abrir uma conexão TCP nova a cada frame, o que custava tempo e fps.
-WiFiClientSecure uploadClient;  // [HTTPS] era WiFiClient
-HTTPClient uploadHttp;
-unsigned long lastSyncAttempt = 0;
-bool sdAvailable = false;
-bool sdCheioAvisado = false;   // evita spam no Serial quando o SD está cheio
-NimBLECharacteristic *pCharacteristic = nullptr;
+QueueHandle_t filaDeEnvio;
+volatile bool capturaEmAndamento = false;
 
-// Chamada só pelo loop() (ver [STOP]). Reaproveita a mesma conexão HTTPS dos
-// frames, em vez de abrir uma segunda, e tenta até 3 vezes se a conexão falhar.
-void notificarEncerramentoSessao(const String &sessionId) {
+// O callback do BLE só marca o fim; o aviso HTTPS sai do loop(), porque a
+// tarefa do BLE não tem pilha para o TLS (reiniciava a placa).
+volatile bool fimDeSessaoRecebido = false;
+String sessaoQueTerminou = "";
+
+String sessoesAguardandoFim[MAX_SESSOES_AGUARDANDO_FIM];
+int totalSessoesAguardandoFim = 0;
+unsigned long ultimaTentativaAvisoFimMs = 0;
+bool ultimoAvisoFimFalhou = false;
+
+// Conexão reaproveitada entre os envios (keep-alive) para não pagar o TLS a cada frame.
+WiFiClientSecure clienteHttps;
+HTTPClient http;
+
+bool cartaoDisponivel = false;
+bool avisoCartaoCheioMostrado = false;
+unsigned long ultimaSincronizacaoMs = 0;
+bool ultimaSincronizacaoOk = true;
+unsigned long ultimoAquecimentoMs = 0;
+bool conexaoJaAquecida = false;
+
+void agendarAvisoDeFim(const String &idSessao);
+void removerPrimeiroAvisoDeFim();
+bool existemPendentesDaSessao(const String &idSessao);
+void processarAvisosDeFim();
+bool reenviarPendentes();
+struct FrameDoLote {
+  uint8_t *jpeg;
+  size_t tamanho;
+  int indice;
+  long tCapturaMs;  // -1 quando desconhecido (arquivo antigo no SD)
+};
+
+bool enviarLote(const String &idSessao, const FrameDoLote *frames, int total);
+void salvarNoCartao(const uint8_t *jpeg, size_t tamanho, const String &idSessao, int indice, unsigned long tCapturaMs);
+void iniciarTarefaDeCaptura();
+void tarefaDeCaptura(void *);
+String idDaSessao(unsigned long inicioMs);
+
+// ==================== AVISO DE FIM DE SESSÃO ====================
+
+int avisarFimDeSessao(const String &idSessao) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Sem Wi-Fi - nao foi possivel notificar o backend do encerramento.");
-    return;
+    Serial.println("Sem Wi-Fi - aviso de fim de sessão adiado.");
+    return -1;
   }
 
-  String corpo = "{\"session_id\":\"" + sessionId + "\"}";
+  String corpo = "{\"session_id\":\"" + idSessao + "\"}";
   int codigo = -1;
-
-  for (int tentativa = 1; tentativa <= 3 && codigo < 0; tentativa++) {
+  for (int tentativa = 1; tentativa <= TENTATIVAS_AVISO_FIM && codigo < 0; tentativa++) {
     if (tentativa > 1) {
-      uploadClient.stop();  // descarta a conexão que falhou e abre outra
-      delay(500);
+      clienteHttps.stop();
+      delay(ESPERA_ENTRE_TENTATIVAS_MS);
     }
-    HTTPClient http;
-    http.setReuse(true);
-    http.begin(uploadClient, SERVER_URL_ENCERRAR);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Dispositivo-Id", DEVICE_ID);    // [CHAVE]
-    http.addHeader("X-Dispositivo-Chave", DEVICE_KEY);
-    codigo = http.POST(corpo);
-    http.end();
+    HTTPClient requisicao;
+    requisicao.setReuse(true);
+    requisicao.begin(clienteHttps, URL_ENCERRAR_SESSAO);
+    requisicao.addHeader("Content-Type", "application/json");
+    requisicao.addHeader("X-Dispositivo-Id", ID_DISPOSITIVO);
+    requisicao.addHeader("X-Dispositivo-Chave", DEVICE_KEY);
+    codigo = requisicao.POST(corpo);
+    requisicao.end();
   }
 
-  Serial.printf("Notificacao de encerramento enviada. Codigo HTTP: %d\n", codigo);
+  Serial.printf("Aviso de fim de sessão enviado. Código HTTP: %d\n", codigo);
+  return codigo;
 }
 
-// ==================== BLE - CALLBACKS ====================
+void agendarAvisoDeFim(const String &idSessao) {
+  if (totalSessoesAguardandoFim == MAX_SESSOES_AGUARDANDO_FIM) {
+    Serial.println("Muitas sessões aguardando o fim - avisando a mais antiga agora.");
+    avisarFimDeSessao(sessoesAguardandoFim[0]);
+    removerPrimeiroAvisoDeFim();
+  }
+  sessoesAguardandoFim[totalSessoesAguardandoFim++] = idSessao;
+}
 
-class TriggerCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo &connInfo) override {
-    std::string value = pChar->getValue();
-    if (value.length() == 0) return;
+void removerPrimeiroAvisoDeFim() {
+  for (int i = 1; i < totalSessoesAguardandoFim; i++) {
+    sessoesAguardandoFim[i - 1] = sessoesAguardandoFim[i];
+  }
+  totalSessoesAguardandoFim--;
+}
 
-    uint8_t cmd = (uint8_t)value[0];
+// Avisa o fim da sessão mais antiga quando não sobrar frame dela no cartão.
+// Sem rede ou com erro do servidor (5xx), tenta de novo depois do intervalo.
+void processarAvisosDeFim() {
+  if (totalSessoesAguardandoFim == 0 || WiFi.status() != WL_CONNECTED) return;
+  if (capturaEmAndamento || uxQueueMessagesWaiting(filaDeEnvio) > 0) return;
+  if (ultimoAvisoFimFalhou && millis() - ultimaTentativaAvisoFimMs < INTERVALO_SINCRONIZACAO_MS) return;
 
-    if (cmd == CMD_START && !recording) {
-      recording = true;
-      frameIndex = 0;
-      sessionStartMs = millis();
-      currentSessionId = String(DEVICE_ID) + "-" + String(sessionStartMs);
-      Serial.println(">> BLE: comando START recebido. Iniciando gravação...");
-    } else if (cmd == CMD_STOP && recording) {
-      recording = false;
-      Serial.println(">> BLE: comando STOP recebido. Gravação encerrada.");
-      sessaoParaEncerrar = currentSessionId;  // [STOP] o loop() avisa o backend
-      encerramentoPendente = true;
-    } else if (cmd == CMD_RESET_WIFI) {
-      Serial.println(">> BLE: comando RESET_WIFI recebido. Apagando rede salva e reiniciando...");
-      WiFiManager wm;
-      wm.resetSettings();
-      delay(500);
-      ESP.restart();
+  const String idSessao = sessoesAguardandoFim[0];
+  if (cartaoDisponivel && existemPendentesDaSessao(idSessao)) return;
+
+  ultimaTentativaAvisoFimMs = millis();
+  int codigo = avisarFimDeSessao(idSessao);
+  bool respostaDefinitiva = codigo >= 200 && codigo < 500;
+  ultimoAvisoFimFalhou = !respostaDefinitiva;
+  if (respostaDefinitiva) removerPrimeiroAvisoDeFim();
+}
+
+// ==================== BLE ====================
+
+String idDaSessao(unsigned long inicioMs) {
+  return String(ID_DISPOSITIVO) + "-" + String(inicioMs);
+}
+
+void iniciarGravacao() {
+  inicioSessaoMs = millis();
+  idSessaoAtual = idDaSessao(inicioSessaoMs);
+  gravando = true;
+  Serial.println(">> BLE: START recebido. Iniciando gravação...");
+}
+
+void pararGravacao() {
+  gravando = false;
+  sessaoQueTerminou = idSessaoAtual;
+  fimDeSessaoRecebido = true;
+}
+
+void apagarRedeSalvaEReiniciar() {
+  Serial.println(">> BLE: RESET_WIFI recebido. Apagando a rede salva e reiniciando...");
+  WiFiManager gerenciador;
+  gerenciador.resetSettings();
+  delay(ESPERA_ENTRE_TENTATIVAS_MS);
+  ESP.restart();
+}
+
+class CallbacksDoComando : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *caracteristica, NimBLEConnInfo &conexao) override {
+    std::string valor = caracteristica->getValue();
+    if (valor.empty()) return;
+
+    uint8_t comando = (uint8_t)valor[0];
+    if (comando == COMANDO_INICIAR && !gravando) {
+      iniciarGravacao();
+    } else if (comando == COMANDO_PARAR && gravando) {
+      pararGravacao();
+      Serial.println(">> BLE: STOP recebido. Gravação encerrada.");
+    } else if (comando == COMANDO_APAGAR_WIFI) {
+      apagarRedeSalvaEReiniciar();
     }
   }
 };
 
-class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
+class CallbacksDoServidor : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *servidor, NimBLEConnInfo &conexao) override {
     Serial.println("Relógio conectado via BLE.");
   }
-  void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override {
-    Serial.println("Relógio desconectado. Reiniciando advertising...");
-    // Se estava gravando e o relógio caiu, é mais seguro parar a gravação.
-    // [STOP] E avisar o backend, pra ele montar o vídeo do que já foi gravado
-    // (senão esses frames ficariam sem virar evidência). Se o relógio
-    // reconectar ainda "gravando", ele manda START e começa uma sessão nova.
-    if (recording) {
-      recording = false;
-      sessaoParaEncerrar = currentSessionId;
-      encerramentoPendente = true;
-    }
+
+  // Relógio caiu no meio da gravação: encerra a sessão para o que já foi
+  // gravado virar evidência. Se ele voltar gravando, manda um START novo.
+  void onDisconnect(NimBLEServer *servidor, NimBLEConnInfo &conexao, int motivo) override {
+    Serial.println("Relógio desconectado. Voltando a anunciar o BLE...");
+    if (gravando) pararGravacao();
     NimBLEDevice::startAdvertising();
   }
 };
 
-void setupBLE() {
-  NimBLEDevice::init(BLE_DEVICE_NAME);
+void iniciarBle() {
+  NimBLEDevice::init(NOME_BLE);
+  NimBLEServer *servidor = NimBLEDevice::createServer();
+  servidor->setCallbacks(new CallbacksDoServidor());
 
-  NimBLEServer *pServer = NimBLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
+  NimBLEService *servico = servidor->createService(UUID_SERVICO);
+  NimBLECharacteristic *caracteristica =
+      servico->createCharacteristic(UUID_CARACTERISTICA, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  caracteristica->setCallbacks(new CallbacksDoComando());
+  servico->start();
 
-  NimBLEService *pService = pServer->createService(SERVICE_UUID);
-
-  pCharacteristic = pService->createCharacteristic(
-      CHARACTERISTIC_UUID,
-      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
-  );
-  pCharacteristic->setCallbacks(new TriggerCallbacks());
-
-  pService->start();
-
-  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->start();
-
-  Serial.println("BLE pronto. Aguardando conexão do relógio...");
+  NimBLEAdvertising *anuncio = NimBLEDevice::getAdvertising();
+  anuncio->addServiceUUID(UUID_SERVICO);
+  anuncio->start();
+  Serial.println("BLE pronto. Aguardando o relógio...");
 }
 
-// ==================== SETUP ====================
+// ==================== INICIALIZAÇÃO ====================
 
-void setup() {
-  Serial.begin(115200);
-  uploadClient.setCACert(ROOT_CA);  // [HTTPS]
-  Serial.setDebugOutput(false);
-  delay(500);
-
-  Serial.println();
-  Serial.println("==============================================");
-  Serial.println("Inicializando ESP32-CAM (AI-Thinker) - sensor GC2145");
-  Serial.println("Modo: captura RGB565 + conversao para JPEG via software");
-  Serial.println("==============================================");
-
-  connectWiFi();
-  setupCamera();
-  imprimirInfoSensor();
-  setupSD();
-  setupBLE();
-
-  Serial.println("Sistema pronto. Aguardando comando BLE do relógio...");
+// Fixa o país em BR para a varredura cobrir os canais 1 a 13 (há roteadores no 12 e no 13).
+void liberarCanaisDoBrasil() {
+  wifi_country_t brasil = {};
+  strcpy(brasil.cc, "BR");
+  brasil.schan = 1;
+  brasil.nchan = 13;
+  brasil.policy = WIFI_COUNTRY_POLICY_MANUAL;
+  esp_wifi_set_country(&brasil);
 }
 
-void connectWiFi() {
-  WiFiManager wm;
+// Roda quando o portal vai abrir. Rede que o celular vê e não aparece aqui é 5 GHz
+// (o ESP32 só tem 2.4 GHz) ou o sinal não chega na antena da placa.
+void listarRedesVisiveis(WiFiManager *) {
+  Serial.println("Redes que a placa enxerga (só 2.4 GHz):");
+  int totalRedes = WiFi.scanNetworks(false, true, false, TEMPO_VARREDURA_POR_CANAL_MS);
+  if (totalRedes <= 0) {
+    Serial.println("  Nenhuma. Confira a antena da placa e a fonte de alimentação.");
+  }
+  for (int i = 0; i < totalRedes; i++) {
+    String nomeRede = WiFi.SSID(i).length() ? WiFi.SSID(i) : String("(rede oculta)");
+    const char *aviso = WiFi.RSSI(i) < SINAL_FRACO_DBM ? "  <- sinal fraco" : "";
+    Serial.printf("  %-32s %4d dBm  canal %2d%s\n", nomeRede.c_str(), WiFi.RSSI(i), WiFi.channel(i), aviso);
+  }
+  WiFi.scanDelete();
+  Serial.println("Se a rede não estiver na lista do portal, digite o nome dela no campo SSID.");
+}
 
-  // Descomente a linha abaixo durante testes/desenvolvimento para forçar
-  // o portal de configuração a abrir toda vez (apaga a rede salva):
-  // wm.resetSettings();
+void conectarWiFi() {
+  WiFiManager gerenciador;
+  gerenciador.setConfigPortalTimeout(TEMPO_PORTAL_CONFIGURACAO_S);
+  gerenciador.setScanDispPerc(true);
+  gerenciador.setAPCallback(listarRedesVisiveis);
 
-  wm.setConfigPortalTimeout(WIFI_CONFIG_TIMEOUT_S);
+  WiFi.mode(WIFI_STA);
+  liberarCanaisDoBrasil();
 
-  Serial.println("Tentando conectar ao Wi-Fi salvo...");
-  Serial.println("Se não conseguir, abrirá o portal de configuração:");
-  Serial.printf("  1. Conecte o celular na rede Wi-Fi \"%s\"\n", WIFI_CONFIG_AP_NAME);
-  Serial.println("  2. Uma página deve abrir automaticamente (ou acesse 192.168.4.1)");
-  Serial.println("  3. Escolha a rede Wi-Fi da casa e digite a senha");
+  Serial.println("Conectando ao Wi-Fi salvo...");
+  Serial.printf("Sem rede salva, conecte o celular em \"%s\" e escolha a rede (192.168.4.1).\n",
+                NOME_REDE_CONFIGURACAO);
 
-  bool conectado = wm.autoConnect(WIFI_CONFIG_AP_NAME);
-
-  if (!conectado) {
-    Serial.println("Não foi possível conectar (timeout do portal). Reiniciando...");
-    delay(3000);
+  if (!gerenciador.autoConnect(NOME_REDE_CONFIGURACAO)) {
+    Serial.println("Portal de configuração expirou. Reiniciando...");
+    delay(ESPERA_ANTES_DE_REINICIAR_MS);
     ESP.restart();
   }
 
-  // Faz o ESP32 tentar reconectar sozinho em segundo plano se a rede cair,
-  // sem precisar reabrir o portal de configuração toda vez
   WiFi.persistent(true);
   WiFi.setAutoReconnect(true);
-
+  // Não desligar o modem sleep (WiFi.setSleep(false)): com BLE ligado o ESP32 aborta.
   Serial.print("Wi-Fi conectado. IP: ");
   Serial.println(WiFi.localIP());
 }
 
-// Monta o cartão microSD em modo 1-bit (evita conflito de pinos com a câmera
-// e o LED de flash, que usam os mesmos GPIOs do modo 4-bit no AI-Thinker)
-void setupSD() {
-  if (!SD_MMC.begin("/sdcard", true)) {
-    Serial.println("Falha ao montar o cartão SD. Buffer offline ficará desabilitado.");
-    sdAvailable = false;
-    return;
-  }
-
-  uint8_t cardType = SD_MMC.cardType();
-  if (cardType == CARD_NONE) {
-    Serial.println("Nenhum cartão SD detectado. Buffer offline ficará desabilitado.");
-    sdAvailable = false;
-    return;
-  }
-
-  if (!SD_MMC.exists(SD_PENDING_DIR)) {
-    SD_MMC.mkdir(SD_PENDING_DIR);
-  }
-
-  sdAvailable = true;
-
-  uint64_t totalMB = SD_MMC.totalBytes() / (1024 * 1024);
-  uint64_t usadoMB = SD_MMC.usedBytes() / (1024 * 1024);
-  Serial.printf("Cartão SD montado. Buffer offline habilitado. (%llu MB usados de %llu MB)\n",
-                usadoMB, totalMB);
-}
-
-// Inicializa a câmera em RGB565 (o GC2145 não suporta PIXFORMAT_JPEG em
-// hardware - ver explicação no topo do arquivo). A conversão para JPEG
-// acontece depois, por software, em capturarEEnviarFrame().
-void setupCamera() {
-  camera_config_t config;
+bool iniciarCamera(pixformat_t formato, framesize_t resolucao) {
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
+  config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
   config.pin_d1 = Y3_GPIO_NUM;
   config.pin_d2 = Y4_GPIO_NUM;
@@ -436,386 +428,481 @@ void setupCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-
-  // GC2145 não tem compressão JPEG em hardware, então usamos um clock
-  // moderado (20 MHz é o valor mais comum e estável para esse sensor;
-  // valores muito altos podem gerar frames RGB565 corrompidos).
-  config.xclk_freq_hz = 20000000;
-
-  // NUNCA use PIXFORMAT_JPEG aqui com o GC2145 - o sensor não suporta
-  // compressão em hardware e o driver retorna erro
-  // "JPEG format is not supported on this sensor".
-  config.pixel_format = PIXFORMAT_RGB565;
-
-  // RGB565 usa 2 bytes por pixel (bem mais pesado que um JPEG já
-  // comprimido): VGA só cabe com PSRAM. Sem PSRAM, fica em QVGA.
-  if (psramFound()) {
-    config.frame_size = FRAME_SIZE_COM_PSRAM;
-    Serial.println("PSRAM encontrada - capturando em alta resolucao.");
-  } else {
-    config.frame_size = FRAME_SIZE_SEM_PSRAM;
-    Serial.println("AVISO: sem PSRAM - capturando em QVGA (320x240). "
-                   "Confira Ferramentas > PSRAM > Enabled na Arduino IDE.");
-  }
-
-  // Não é usado com RGB565 (a qualidade da conversão por software é o
-  // JPEG_QUALIDADE_SW, passado direto pro frame2jpg). Fica só por completude.
-  config.jpeg_quality = 12;
+  // Acima de 20 MHz o GC2145 gera frames RGB565 corrompidos.
+  config.xclk_freq_hz = FREQUENCIA_XCLK_HZ;
+  config.pixel_format = formato;
+  config.frame_size = resolucao;
+  config.jpeg_quality = QUALIDADE_JPEG_HARDWARE;
   config.fb_count = psramFound() ? 2 : 1;
   config.grab_mode = psramFound() ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Falha ao iniciar a câmera: 0x%x\n", err);
-    delay(3000);
+  esp_err_t erro = esp_camera_init(&config);
+  if (erro != ESP_OK) {
+    Serial.printf("Falha ao iniciar a câmera: 0x%x\n", erro);
+    return false;
+  }
+  return true;
+}
+
+// Tenta JPEG por hardware (OV2640); o GC2145 recusa e cai para RGB565.
+// Não dá para desligar e reiniciar a câmera: o sensor para de responder.
+void configurarCamera() {
+  if (!psramFound()) {
+    Serial.println("AVISO: sem PSRAM - capturando em QVGA. Confira Ferramentas > PSRAM > Enabled.");
+  }
+
+  bool iniciou = psramFound() && iniciarCamera(PIXFORMAT_JPEG, RESOLUCAO_JPEG_HARDWARE);
+  if (iniciou) {
+    Serial.println("Câmera em JPEG por hardware (OV2640).");
+  } else {
+    framesize_t resolucao = psramFound() ? RESOLUCAO_RGB_COM_PSRAM : RESOLUCAO_RGB_SEM_PSRAM;
+    iniciou = iniciarCamera(PIXFORMAT_RGB565, resolucao);
+  }
+  if (!iniciou) {
+    delay(ESPERA_ANTES_DE_REINICIAR_MS);
     ESP.restart();
   }
 
-  // Ajustes finos opcionais do sensor
-  sensor_t *s = esp_camera_sensor_get();
-  if (s) {
-    s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
-    s->set_saturation(s, 0);
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor) {
+    sensor->set_brightness(sensor, 0);
+    sensor->set_contrast(sensor, 0);
+    sensor->set_saturation(sensor, 0);
   }
 }
 
-void imprimirInfoSensor() {
-  sensor_t *s = esp_camera_sensor_get();
-  if (!s) {
-    Serial.println("Não foi possível obter handle do sensor (esp_camera_sensor_get retornou NULL).");
+void mostrarSensorDetectado() {
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (!sensor) {
+    Serial.println("Não foi possível ler o sensor da câmera.");
     return;
   }
 
-  Serial.printf("PID do sensor detectado: 0x%04X\n", s->id.PID);
-  // Comparamos diretamente com 0x2145 (PID do GC2145) em vez de usar uma
-  // constante simbólica, pois nem toda versão da lib esp32-camera define
-  // um macro específico para esse sensor.
-  if (s->id.PID == 0x2145) {
+  Serial.printf("PID do sensor: 0x%04X\n", sensor->id.PID);
+  if (sensor->id.PID == PID_GC2145) {
     Serial.println("Sensor confirmado: GC2145.");
+  } else if (sensor->id.PID == PID_OV2640) {
+    Serial.println("Sensor confirmado: OV2640.");
   } else {
-    Serial.println("Aviso: PID diferente do esperado para GC2145 - verifique o hardware/pinout.");
+    Serial.println("Aviso: sensor desconhecido - confira o hardware e os pinos.");
   }
 }
 
-// ==================== LOOP PRINCIPAL ====================
-
-void loop() {
-  // Nota: usamos millis() em vez de delay() para não travar o stack BLE
-  // enquanto grava, senão o comando de STOP pode demorar a ser processado.
-
-  // [STOP] Aviso de encerramento pedido pelo BLE (ver notificarEncerramentoSessao).
-  if (encerramentoPendente) {
-    encerramentoPendente = false;
-    notificarEncerramentoSessao(sessaoParaEncerrar);
+// Modo 1-bit: no AI-Thinker, o modo 4-bit usa os mesmos pinos do flash.
+void montarCartao() {
+  if (!SD_MMC.begin("/sdcard", true) || SD_MMC.cardType() == CARD_NONE) {
+    Serial.println("Cartão SD não encontrado. Buffer offline desabilitado.");
+    cartaoDisponivel = false;
+    return;
   }
 
-  if (recording) {
-    if (millis() - lastFrameTime >= INTERVALO_FRAMES_MS) {
-      lastFrameTime = millis();
-      capturarEEnviarFrame();
-    }
-  } else {
-    frameIndex = 0; // reseta contador quando não está gravando
+  if (!SD_MMC.exists(PASTA_PENDENTES)) SD_MMC.mkdir(PASTA_PENDENTES);
+  cartaoDisponivel = true;
+  Serial.printf("Cartão SD montado. Buffer offline habilitado. (%llu MB usados de %llu MB)\n",
+                SD_MMC.usedBytes() / BYTES_POR_MB, SD_MMC.totalBytes() / BYTES_POR_MB);
+}
 
-    // Só tenta sincronizar pendentes fora do horário de gravação, para não
-    // competir com o envio dos frames "ao vivo"
-    if (sdAvailable && WiFi.status() == WL_CONNECTED &&
-        millis() - lastSyncAttempt >= SYNC_INTERVAL_MS) {
-      lastSyncAttempt = millis();
-      sincronizarPendentes();
-    }
+void setup() {
+  Serial.begin(VELOCIDADE_SERIAL);
+  Serial.setDebugOutput(false);
+  clienteHttps.setCACert(CERTIFICADOS_RAIZ);
+  delay(500);
+
+  Serial.println("\n=== Safe Evidence - ESP32-CAM ===");
+  conectarWiFi();
+  configurarCamera();
+  mostrarSensorDetectado();
+  montarCartao();
+  // O BLE vem antes: ele precisa de um bloco grande de RAM interna e aborta se faltar.
+  iniciarBle();
+  iniciarTarefaDeCaptura();
+  Serial.println("Sistema pronto. Aguardando o comando do relógio...");
+}
+
+// ==================== LAÇO PRINCIPAL ====================
+
+// O laço não usa delay() longo para o BLE continuar respondendo durante a gravação.
+void loop() {
+  if (fimDeSessaoRecebido) {
+    fimDeSessaoRecebido = false;
+    agendarAvisoDeFim(sessaoQueTerminou);
+  }
+
+  FrameCapturado lote[MAX_FRAMES_POR_LOTE];
+  int totalNoLote = receberLoteDaFila(lote);
+  if (totalNoLote > 0) {
+    enviarOuGuardarLote(lote, totalNoLote);
+  } else if (!gravando) {
+    manterConexaoPronta();
+    sincronizarPendentes();
+    processarAvisosDeFim();
   }
 
   delay(5);
 }
 
-// ==================== CAPTURA, CONVERSÃO E ENVIO ====================
+// Deixa o TLS aberto enquanto espera o START, para o primeiro frame não pagar o handshake.
+void manterConexaoPronta() {
+  if (clienteHttps.connected() || WiFi.status() != WL_CONNECTED) return;
+  if (conexaoJaAquecida && millis() - ultimoAquecimentoMs < INTERVALO_AQUECIMENTO_CONEXAO_MS) return;
 
-// Captura um frame em RGB565, converte para JPEG por software (frame2jpg)
-// e então tenta enviar ao vivo; se falhar, salva o JPEG no SD para
-// reenvio posterior. Sempre libera fb (câmera) e o buffer JPEG.
-void capturarEEnviarFrame() {
-  unsigned long t0 = millis();
-  camera_fb_t *fb = esp_camera_fb_get();
-
-  // Momento da captura, relativo ao início da sessão. Vai junto com o
-  // frame (inclusive quando ele passa pelo SD) pro backend montar o vídeo
-  // na velocidade real, mesmo que a taxa de frames varie.
-  unsigned long tCapturaMs = millis() - sessionStartMs;
-
-  if (!fb) {
-    Serial.println("Erro ao capturar frame (esp_camera_fb_get retornou NULL).");
-    return;
-  }
-
-  // --- Conversão RGB565 -> JPEG via software ---
-  // frame2jpg aloca internamente o buffer de saída (jpgBuf); é
-  // responsabilidade de quem chama liberar esse buffer com free() depois.
-  uint8_t *jpgBuf = nullptr;
-  size_t jpgLen = 0;
-
-  bool converteu = frame2jpg(fb, JPEG_QUALIDADE_SW, &jpgBuf, &jpgLen);
-  unsigned long t1 = millis();
-
-  // O frame RAW (fb) já não é mais necessário depois da conversão -
-  // libera imediatamente para não segurar o buffer da câmera por mais
-  // tempo que o necessário.
-  esp_camera_fb_return(fb);
-
-  if (!converteu) {
-    // Causas comuns: memória insuficiente para o buffer de saída, ou
-    // falha interna na conversão.
-    Serial.println("Erro: frame2jpg() falhou (memória insuficiente ou falha na conversão). Frame descartado.");
-    return;
-  }
-
-  if (jpgBuf == nullptr || jpgLen == 0) {
-    Serial.println("Erro: frame2jpg() retornou sucesso, mas buffer de saída inválido. Frame descartado.");
-    if (jpgBuf) free(jpgBuf);
-    return;
-  }
-
-  bool enviouAoVivo = false;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    enviouAoVivo = enviarBytes(jpgBuf, jpgLen, currentSessionId, frameIndex, tCapturaMs);
-  } else {
-    Serial.println("Sem Wi-Fi no momento.");
-  }
-
-  if (!enviouAoVivo) {
-    Serial.printf("Frame %d não enviado ao vivo -> salvando no SD.\n", frameIndex);
-    salvarBytesNoSD(jpgBuf, jpgLen, currentSessionId, frameIndex, tCapturaMs);
-  }
-
-  // Diagnóstico de desempenho: quanto tempo cada etapa levou. A soma é o
-  // que limita os fps (ex.: 250 ms no total = ~4 fps).
-  unsigned long t2 = millis();
-  Serial.printf("Frame %d: %u bytes | captura+conversao %lu ms | envio %lu ms | total %lu ms\n",
-                frameIndex, (unsigned)jpgLen, t1 - t0, t2 - t1, t2 - t0);
-
-  free(jpgBuf); // libera o buffer JPEG alocado pelo frame2jpg, sempre
-  frameIndex++;
+  conexaoJaAquecida = true;
+  ultimoAquecimentoMs = millis();
+  bool conectou = clienteHttps.connect(HOST_BACKEND, PORTA_HTTPS);
+  Serial.printf("%s (%lu ms).\n", conectou ? "Conexão HTTPS pronta" : "Falha ao abrir a conexão HTTPS",
+                millis() - ultimoAquecimentoMs);
 }
 
-// Verifica se há espaço livre suficiente no SD, respeitando uma margem de
-// segurança (para não deixar o cartão 100% cheio, o que pode corromper
-// gravações em andamento)
-bool espacoSuficienteSD(size_t tamanhoNecessario) {
-  uint64_t total = SD_MMC.totalBytes();
-  uint64_t usado = SD_MMC.usedBytes();
-  uint64_t livre = (total > usado) ? (total - usado) : 0;
-
-  return livre > ((uint64_t)SD_MARGEM_MINIMA_BYTES + tamanhoNecessario);
-}
-
-// Salva um buffer JPEG já convertido no cartão SD para reenviar depois,
-// quando a rede voltar
-void salvarBytesNoSD(const uint8_t *dados, size_t tamanho, const String &sessionId, int frameIdx,
-                     unsigned long tCapturaMs) {
-  if (!sdAvailable) {
-    Serial.println("SD indisponível - frame foi perdido.");
-    return;
-  }
-
-  if (!espacoSuficienteSD(tamanho)) {
-    if (!sdCheioAvisado) {
-      Serial.println("!! SD CHEIO (ou perto disso) - frames deixarão de ser salvos até liberar espaço.");
-      sdCheioAvisado = true;
-    }
-    return; // não tenta escrever - evita corromper o cartão ou travar a escrita
-  }
-
-  sdCheioAvisado = false; // se chegou aqui, tinha espaço - reseta o aviso
-
-  // Formato: <sessionId>__<frameIndex>__<tCapturaMs>.jpg
-  String caminho = String(SD_PENDING_DIR) + "/" + sessionId + "__" + String(frameIdx) +
-                   "__" + String(tCapturaMs) + ".jpg";
-
-  File file = SD_MMC.open(caminho, FILE_WRITE);
-  if (!file) {
-    Serial.println("Falha ao criar arquivo no SD: " + caminho);
-    return;
-  }
-
-  file.write(dados, tamanho);
-  file.close();
-
-  Serial.println("Frame salvo no SD: " + caminho);
-}
-
-// Varre a pasta de pendentes e tenta reenviar cada arquivo (já em JPEG);
-// apaga do SD somente após confirmação de sucesso no envio
+// Fora da gravação, para não disputar a rede com os frames ao vivo. Com uma
+// sessão esperando o aviso de fim, reenvia sem pausa enquanto a rede responder.
 void sincronizarPendentes() {
-  File dir = SD_MMC.open(SD_PENDING_DIR);
-  if (!dir || !dir.isDirectory()) {
-    return;
-  }
-
-  int enviados = 0;
-  File entry = dir.openNextFile();
-
-  while (entry && enviados < SYNC_MAX_POR_CICLO) {
-    if (!entry.isDirectory()) {
-      String caminho = String(entry.name());
-      // Alguns cores retornam só o nome, outros o caminho completo - normaliza:
-      if (!caminho.startsWith("/")) {
-        caminho = String(SD_PENDING_DIR) + "/" + caminho;
-      }
-
-      size_t tamanho = entry.size();
-      uint8_t *buffer = (uint8_t *)malloc(tamanho);
-
-      if (buffer) {
-        entry.read(buffer, tamanho);
-        entry.close(); // fecha antes de tentar deletar/reabrir
-
-        String sessionId;
-        int frameIdx = 0;
-        long tCapturaMs = -1;
-        parseNomeArquivo(caminho, sessionId, frameIdx, tCapturaMs);
-
-        Serial.println("Reenviando pendente: " + caminho);
-        bool ok = enviarBytes(buffer, tamanho, sessionId, frameIdx, tCapturaMs);
-        free(buffer);
-
-        if (ok) {
-          SD_MMC.remove(caminho);
-          Serial.println("Pendente enviado e removido do SD: " + caminho);
-          enviados++;
-        } else {
-          Serial.println("Falha ao reenviar pendente, mantendo no SD: " + caminho);
-          // Se falhar, para o ciclo atual (provavelmente a rede caiu de novo)
-          break;
-        }
-      } else {
-        entry.close();
-        Serial.println("Falha ao alocar memória para reenviar: " + caminho);
-        break;
-      }
-    } else {
-      entry.close();
-    }
-
-    entry = dir.openNextFile();
-  }
-
-  dir.close();
-}
-
-// Extrai sessionId, frameIndex e tempo de captura de um caminho no formato:
-//   /pending/<sessionId>__<frameIndex>__<tCapturaMs>.jpg
-// Também aceita o formato antigo, sem tempo (/pending/<sessionId>__<frameIndex>.jpg):
-// nesse caso tCapturaMs fica -1 e o backend usa o intervalo padrão.
-void parseNomeArquivo(const String &caminho, String &sessionId, int &frameIdx, long &tCapturaMs) {
-  String nome = caminho.substring(caminho.lastIndexOf('/') + 1);
-  int sep = nome.indexOf("__");
-  int extPos = nome.lastIndexOf(".jpg");
-  tCapturaMs = -1;
-
-  if (sep == -1 || extPos == -1) {
-    sessionId = "desconhecido";
-    frameIdx = 0;
-    return;
-  }
-
-  sessionId = nome.substring(0, sep);
-
-  String resto = nome.substring(sep + 2, extPos);   // "<frame>__<t>" ou "<frame>"
-  int sep2 = resto.indexOf("__");
-  if (sep2 == -1) {
-    frameIdx = resto.toInt();
-  } else {
-    frameIdx = resto.substring(0, sep2).toInt();
-    tCapturaMs = resto.substring(sep2 + 2).toInt();
+  bool avisoDeFimEsperando = totalSessoesAguardandoFim > 0 && ultimaSincronizacaoOk;
+  bool intervaloPassou = millis() - ultimaSincronizacaoMs >= INTERVALO_SINCRONIZACAO_MS;
+  if (cartaoDisponivel && WiFi.status() == WL_CONNECTED && (avisoDeFimEsperando || intervaloPassou)) {
+    ultimaSincronizacaoMs = millis();
+    ultimaSincronizacaoOk = reenviarPendentes();
   }
 }
 
-// Monta o multipart/form-data e envia via HTTP POST. Usado tanto para o
-// frame "ao vivo" (já em JPEG, pós conversão) quanto para reenviar
-// arquivos pendentes do SD.
-// tCapturaMs: ms desde o início da sessão (-1 = desconhecido, não é enviado).
-bool enviarBytes(uint8_t *dados, size_t tamanho, const String &sessionId, int frameIndex,
-                 long tCapturaMs) {
-  String boundary = "----ESP32CAMBOUNDARY";
+// ==================== CAPTURA ====================
 
-  String bodyStart =
-      "--" + boundary + "\r\n" +
-      "Content-Disposition: form-data; name=\"device_id\"\r\n\r\n" +
-      String(DEVICE_ID) + "\r\n" +
-      "--" + boundary + "\r\n" +
-      "Content-Disposition: form-data; name=\"session_id\"\r\n\r\n" +
-      sessionId + "\r\n" +
-      "--" + boundary + "\r\n" +
-      "Content-Disposition: form-data; name=\"frame_index\"\r\n\r\n" +
-      String(frameIndex) + "\r\n" +
-      "--" + boundary + "\r\n" +
-      "Content-Disposition: form-data; name=\"timestamp\"\r\n\r\n" +
-      String(millis()) + "\r\n" +
-      "--" + boundary + "\r\n";
+void iniciarTarefaDeCaptura() {
+  int tamanhoFila = psramFound() ? TAMANHO_FILA_COM_PSRAM : TAMANHO_FILA_SEM_PSRAM;
+  filaDeEnvio = xQueueCreate(tamanhoFila, sizeof(FrameCapturado));
+  BaseType_t criou = xTaskCreatePinnedToCore(tarefaDeCaptura, "captura", PILHA_TAREFA_CAPTURA, nullptr,
+                                             PRIORIDADE_TAREFA_CAPTURA, nullptr, NUCLEO_TAREFA_CAPTURA);
+  Serial.printf("Tarefa de captura %s. RAM interna livre: %u bytes\n", criou == pdPASS ? "iniciada" : "NÃO criada",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
 
-  // Tempo de captura: precisa vir ANTES do campo "image" (o multer do
-  // backend usa esse valor pra nomear o arquivo).
-  if (tCapturaMs >= 0) {
-    bodyStart += "Content-Disposition: form-data; name=\"t_captura_ms\"\r\n\r\n";
-    bodyStart += String(tCapturaMs) + "\r\n";
-    bodyStart += "--" + boundary + "\r\n";
-  }
+uint8_t *alocarBufferDeFrame(size_t tamanho) {
+  return (uint8_t *)(psramFound() ? ps_malloc(tamanho) : malloc(tamanho));
+}
 
-  bodyStart +=
-      "Content-Disposition: form-data; name=\"image\"; filename=\"frame.jpg\"\r\n"
-      "Content-Type: image/jpeg\r\n\r\n";
-
-  String bodyEnd = "\r\n--" + boundary + "--\r\n";
-
-  size_t totalLen = bodyStart.length() + tamanho + bodyEnd.length();
-
-  uint8_t *buffer = (uint8_t *)malloc(totalLen);
-  if (!buffer) {
-    Serial.println("Falha ao alocar memória para envio.");
+// Devolve o quadro da câmera na hora e entrega um JPEG próprio, que vive até ser enviado ou salvo.
+bool capturarJpeg(uint8_t **jpeg, size_t *tamanho) {
+  camera_fb_t *quadro = esp_camera_fb_get();
+  if (!quadro) {
+    Serial.println("Erro ao capturar frame.");
     return false;
   }
 
-  size_t pos = 0;
-  memcpy(buffer + pos, bodyStart.c_str(), bodyStart.length());
-  pos += bodyStart.length();
-  memcpy(buffer + pos, dados, tamanho);
-  pos += tamanho;
-  memcpy(buffer + pos, bodyEnd.c_str(), bodyEnd.length());
-  pos += bodyEnd.length();
+  bool converteu;
+  if (quadro->format == PIXFORMAT_JPEG) {
+    *tamanho = quadro->len;
+    *jpeg = quadro->len > 0 ? alocarBufferDeFrame(quadro->len) : nullptr;
+    if (*jpeg) memcpy(*jpeg, quadro->buf, quadro->len);
+    converteu = *jpeg != nullptr;
+  } else {
+    converteu = frame2jpg(quadro, QUALIDADE_JPEG_SOFTWARE, jpeg, tamanho) && *jpeg && *tamanho > 0;
+  }
+  esp_camera_fb_return(quadro);
 
-  // Reaproveita a conexão TCP (keep-alive) entre um frame e outro.
-  uploadHttp.setReuse(true);
-  uploadHttp.begin(uploadClient, SERVER_URL);
-  uploadHttp.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-  uploadHttp.addHeader("X-Dispositivo-Id", DEVICE_ID);    // [CHAVE]
-  uploadHttp.addHeader("X-Dispositivo-Chave", DEVICE_KEY);
-  int httpResponseCode = uploadHttp.POST(buffer, totalLen);
-  uploadHttp.end();
+  if (!converteu) {
+    Serial.println("Erro: frame vazio ou sem memória. Frame descartado.");
+    if (*jpeg) free(*jpeg);
+  }
+  return converteu;
+}
 
-  // Código negativo = erro de conexão (ex.: o servidor fechou a conexão
-  // reaproveitada enquanto ela estava parada). Tenta UMA vez de novo com
-  // uma conexão nova antes de desistir e mandar o frame pro SD.
-  if (httpResponseCode < 0) {
-    uploadClient.stop();
-    uploadHttp.begin(uploadClient, SERVER_URL);
-    uploadHttp.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-    uploadHttp.addHeader("X-Dispositivo-Id", DEVICE_ID);    // [CHAVE]
-    uploadHttp.addHeader("X-Dispositivo-Chave", DEVICE_KEY);
-    httpResponseCode = uploadHttp.POST(buffer, totalLen);
-    uploadHttp.end();
+void capturarFrame(int indice) {
+  FrameCapturado frame;
+  frame.inicioSessaoMs = inicioSessaoMs;
+  frame.indice = indice;
+  frame.tCapturaMs = millis() - frame.inicioSessaoMs;
+  frame.jpeg = nullptr;
+  if (!capturarJpeg(&frame.jpeg, &frame.tamanho)) return;
+
+  if (xQueueSend(filaDeEnvio, &frame, 0) == pdTRUE) return;
+
+  Serial.printf("Fila cheia - frame %d vai para o SD.\n", indice);
+  salvarNoCartao(frame.jpeg, frame.tamanho, idDaSessao(frame.inicioSessaoMs), indice, frame.tCapturaMs);
+  free(frame.jpeg);
+}
+
+// Captura no ritmo de INTERVALO_FRAMES_MS mesmo com a rede lenta: o envio
+// acontece no loop() e não segura mais a câmera.
+void tarefaDeCaptura(void *) {
+  unsigned long sessaoAnterior = 0;
+  int indice = 0;
+  TickType_t proximoFrame = xTaskGetTickCount();
+
+  for (;;) {
+    vTaskDelayUntil(&proximoFrame, pdMS_TO_TICKS(INTERVALO_FRAMES_MS));
+
+    capturaEmAndamento = true;
+    if (gravando) {
+      if (inicioSessaoMs != sessaoAnterior) {
+        sessaoAnterior = inicioSessaoMs;
+        indice = 0;
+      }
+      capturarFrame(indice++);
+    }
+    capturaEmAndamento = false;
+  }
+}
+
+// ==================== ENVIO ====================
+
+// Sem PSRAM o corpo do lote ocuparia a RAM interna, que o TLS também precisa.
+int limiteDoLote() {
+  return psramFound() ? MAX_FRAMES_POR_LOTE : 1;
+}
+
+// Junta o que já está na fila, sem esperar frames novos: com a rede rápida o
+// lote tem 1 frame e a latência não muda; com ela lenta, o lote cresce sozinho.
+int receberLoteDaFila(FrameCapturado *lote) {
+  int total = 0;
+  FrameCapturado proximo;
+  while (total < limiteDoLote() && xQueuePeek(filaDeEnvio, &proximo, 0) == pdTRUE) {
+    if (total > 0 && proximo.inicioSessaoMs != lote[0].inicioSessaoMs) break;
+    xQueueReceive(filaDeEnvio, &lote[total++], 0);
+  }
+  return total;
+}
+
+void enviarOuGuardarLote(FrameCapturado *lote, int total) {
+  String idSessao = idDaSessao(lote[0].inicioSessaoMs);
+  FrameDoLote frames[MAX_FRAMES_POR_LOTE];
+  size_t bytes = 0;
+  for (int i = 0; i < total; i++) {
+    frames[i] = {lote[i].jpeg, lote[i].tamanho, lote[i].indice, (long)lote[i].tCapturaMs};
+    bytes += lote[i].tamanho;
   }
 
-  free(buffer);
-
-  bool sucesso = (httpResponseCode == 200 || httpResponseCode == 201);
-
-  if (!sucesso) {
-    Serial.printf("Erro no envio. Código HTTP: %d\n", httpResponseCode);
+  unsigned long inicioEnvio = millis();
+  bool enviado = WiFi.status() == WL_CONNECTED && enviarLote(idSessao, frames, total);
+  if (!enviado) {
+    Serial.printf("Lote não enviado ao vivo -> salvando %d frames no SD.\n", total);
+    for (int i = 0; i < total; i++) {
+      salvarNoCartao(lote[i].jpeg, lote[i].tamanho, idSessao, lote[i].indice, lote[i].tCapturaMs);
+    }
   }
 
+  unsigned long agora = millis();
+  Serial.printf("Lote de %d (frames %d a %d): %u bytes | envio %lu ms | atraso do mais antigo %lu ms | na fila %u\n",
+                total, lote[0].indice, lote[total - 1].indice, (unsigned)bytes, agora - inicioEnvio,
+                agora - lote[0].inicioSessaoMs - lote[0].tCapturaMs, (unsigned)uxQueueMessagesWaiting(filaDeEnvio));
+  for (int i = 0; i < total; i++) free(lote[i].jpeg);
+}
+
+String campoDeTexto(const String &separador, const char *nome, const String &valor) {
+  return "--" + separador + "\r\nContent-Disposition: form-data; name=\"" + nome + "\"\r\n\r\n" + valor + "\r\n";
+}
+
+// O backend tira o índice e o tempo de captura do nome: "<indice>_<tCapturaMs>.jpg".
+String cabecalhoDaImagem(const String &separador, const FrameDoLote &frame) {
+  String nomeArquivo = String(frame.indice);
+  if (frame.tCapturaMs >= 0) nomeArquivo += "_" + String(frame.tCapturaMs);
+  return "--" + separador + "\r\nContent-Disposition: form-data; name=\"images\"; filename=\"" + nomeArquivo +
+         ".jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+}
+
+int postarFormulario(const String &separador, uint8_t *corpo, size_t tamanho) {
+  http.setReuse(true);
+  http.begin(clienteHttps, URL_UPLOAD_LOTE);
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + separador);
+  http.addHeader("X-Dispositivo-Id", ID_DISPOSITIVO);
+  http.addHeader("X-Dispositivo-Chave", DEVICE_KEY);
+  int codigo = http.POST(corpo, tamanho);
+  http.end();
+  return codigo;
+}
+
+// Os campos de texto vêm antes das imagens: o backend usa o session_id para escolher a pasta.
+bool enviarLote(const String &idSessao, const FrameDoLote *frames, int total) {
+  const String separador = "----ESP32CAMBOUNDARY";
+  const String campos = campoDeTexto(separador, "device_id", ID_DISPOSITIVO) +
+                        campoDeTexto(separador, "session_id", idSessao) +
+                        campoDeTexto(separador, "timestamp", String(millis()));
+  const String fimDaParte = "\r\n";
+  const String fim = "--" + separador + "--\r\n";
+
+  String cabecalhos[MAX_FRAMES_POR_LOTE];
+  size_t tamanhoTotal = campos.length() + fim.length();
+  for (int i = 0; i < total; i++) {
+    cabecalhos[i] = cabecalhoDaImagem(separador, frames[i]);
+    tamanhoTotal += cabecalhos[i].length() + frames[i].tamanho + fimDaParte.length();
+  }
+
+  uint8_t *corpo = alocarBufferDeFrame(tamanhoTotal);
+  if (!corpo) {
+    Serial.println("Falha ao alocar memória para o envio.");
+    return false;
+  }
+  size_t posicao = 0;
+  auto copiar = [&](const void *dados, size_t tamanho) {
+    memcpy(corpo + posicao, dados, tamanho);
+    posicao += tamanho;
+  };
+  copiar(campos.c_str(), campos.length());
+  for (int i = 0; i < total; i++) {
+    copiar(cabecalhos[i].c_str(), cabecalhos[i].length());
+    copiar(frames[i].jpeg, frames[i].tamanho);
+    copiar(fimDaParte.c_str(), fimDaParte.length());
+  }
+  copiar(fim.c_str(), fim.length());
+
+  int codigo = postarFormulario(separador, corpo, tamanhoTotal);
+  // Código negativo: a conexão reaproveitada caiu enquanto estava parada; tenta uma vez com outra.
+  if (codigo < 0) {
+    clienteHttps.stop();
+    codigo = postarFormulario(separador, corpo, tamanhoTotal);
+  }
+  free(corpo);
+
+  bool sucesso = codigo == 200 || codigo == 201;
+  if (!sucesso) Serial.printf("Erro no envio. Código HTTP: %d\n", codigo);
   return sucesso;
 }
 
+// ==================== BUFFER NO CARTÃO SD ====================
+
+bool cabeNoCartao(size_t tamanho) {
+  uint64_t total = SD_MMC.totalBytes();
+  uint64_t usado = SD_MMC.usedBytes();
+  uint64_t livre = total > usado ? total - usado : 0;
+  return livre > (uint64_t)MARGEM_LIVRE_SD_BYTES + tamanho;
+}
+
+// Nome do arquivo: <sessão>__<índice>__<tCapturaMs>.jpg
+void salvarNoCartao(const uint8_t *jpeg, size_t tamanho, const String &idSessao, int indice,
+                    unsigned long tCapturaMs) {
+  if (!cartaoDisponivel) {
+    Serial.println("SD indisponível - frame perdido.");
+    return;
+  }
+  if (!cabeNoCartao(tamanho)) {
+    if (!avisoCartaoCheioMostrado) {
+      Serial.println("!! SD cheio - novos frames não serão salvos até liberar espaço.");
+      avisoCartaoCheioMostrado = true;
+    }
+    return;
+  }
+  avisoCartaoCheioMostrado = false;
+
+  String caminho = String(PASTA_PENDENTES) + "/" + idSessao + "__" + String(indice) + "__" + String(tCapturaMs) + ".jpg";
+  File arquivo = SD_MMC.open(caminho, FILE_WRITE);
+  if (!arquivo) {
+    Serial.println("Falha ao criar arquivo no SD: " + caminho);
+    return;
+  }
+  arquivo.write(jpeg, tamanho);
+  arquivo.close();
+  Serial.println("Frame salvo no SD: " + caminho);
+}
+
+// Alguns cores devolvem só o nome do arquivo, outros o caminho completo.
+String caminhoCompleto(File &arquivo) {
+  String nome = String(arquivo.name());
+  return nome.startsWith("/") ? nome : String(PASTA_PENDENTES) + "/" + nome;
+}
+
+// Aceita também o formato antigo, sem tempo (<sessão>__<índice>.jpg): tCapturaMs fica -1.
+void lerNomeDoPendente(const String &caminho, String &idSessao, int &indice, long &tCapturaMs) {
+  String nome = caminho.substring(caminho.lastIndexOf('/') + 1);
+  int separador = nome.indexOf("__");
+  int extensao = nome.lastIndexOf(".jpg");
+  tCapturaMs = -1;
+
+  if (separador == -1 || extensao == -1) {
+    idSessao = "desconhecido";
+    indice = 0;
+    return;
+  }
+
+  idSessao = nome.substring(0, separador);
+  String resto = nome.substring(separador + 2, extensao);
+  int segundoSeparador = resto.indexOf("__");
+  if (segundoSeparador == -1) {
+    indice = resto.toInt();
+  } else {
+    indice = resto.substring(0, segundoSeparador).toInt();
+    tCapturaMs = resto.substring(segundoSeparador + 2).toInt();
+  }
+}
+
+// Lê do SD um lote de frames da sessão do primeiro arquivo encontrado; os de
+// outras sessões ficam para o próximo lote, porque cada POST leva um session_id só.
+int lerLoteDoCartao(String &idSessao, String *caminhos, FrameDoLote *frames) {
+  File pasta = SD_MMC.open(PASTA_PENDENTES);
+  if (!pasta || !pasta.isDirectory()) return 0;
+
+  int total = 0;
+  for (File arquivo = pasta.openNextFile(); arquivo && total < limiteDoLote(); arquivo = pasta.openNextFile()) {
+    String caminho = caminhoCompleto(arquivo);
+    String sessaoDoArquivo;
+    FrameDoLote frame;
+    lerNomeDoPendente(caminho, sessaoDoArquivo, frame.indice, frame.tCapturaMs);
+    bool outraSessao = total > 0 && sessaoDoArquivo != idSessao;
+    if (arquivo.isDirectory() || outraSessao) {
+      arquivo.close();
+      continue;
+    }
+
+    frame.tamanho = arquivo.size();
+    if (frame.tamanho == 0) {  // gravação interrompida por queda de energia
+      arquivo.close();
+      SD_MMC.remove(caminho);
+      continue;
+    }
+    frame.jpeg = alocarBufferDeFrame(frame.tamanho);
+    if (!frame.jpeg) {
+      arquivo.close();
+      break;
+    }
+    arquivo.read(frame.jpeg, frame.tamanho);
+    arquivo.close();
+
+    idSessao = sessaoDoArquivo;
+    caminhos[total] = caminho;
+    frames[total++] = frame;
+  }
+  pasta.close();
+  return total;
+}
+
+// Só apaga os arquivos depois da confirmação do backend.
+// Devolve quantos frames saíram do SD, ou -1 se o envio falhou.
+int reenviarLoteDoCartao() {
+  String idSessao;
+  String caminhos[MAX_FRAMES_POR_LOTE];
+  FrameDoLote frames[MAX_FRAMES_POR_LOTE];
+  int total = lerLoteDoCartao(idSessao, caminhos, frames);
+  if (total == 0) return 0;
+
+  bool enviado = enviarLote(idSessao, frames, total);
+  for (int i = 0; i < total; i++) {
+    free(frames[i].jpeg);
+    if (enviado) SD_MMC.remove(caminhos[i]);
+  }
+  Serial.printf("%s %d pendentes da sessão %s (frames %d a %d).\n", enviado ? "Reenviados" : "Falha ao reenviar",
+                total, idSessao.c_str(), frames[0].indice, frames[total - 1].indice);
+  return enviado ? total : -1;
+}
+
+// Devolve false se algum reenvio falhou (a rede provavelmente caiu de novo).
+bool reenviarPendentes() {
+  for (int lote = 0; lote < MAX_LOTES_REENVIADOS_POR_CICLO; lote++) {
+    int enviados = reenviarLoteDoCartao();
+    if (enviados < 0) return false;
+    if (enviados == 0) break;
+  }
+  return true;
+}
+
+bool existemPendentesDaSessao(const String &idSessao) {
+  File pasta = SD_MMC.open(PASTA_PENDENTES);
+  if (!pasta || !pasta.isDirectory()) return false;
+
+  String prefixo = idSessao + "__";
+  bool encontrou = false;
+  for (File arquivo = pasta.openNextFile(); arquivo && !encontrou; arquivo = pasta.openNextFile()) {
+    String nome = String(arquivo.name());
+    encontrou = nome.substring(nome.lastIndexOf('/') + 1).startsWith(prefixo);
+    arquivo.close();
+  }
+  pasta.close();
+  return encontrou;
+}
