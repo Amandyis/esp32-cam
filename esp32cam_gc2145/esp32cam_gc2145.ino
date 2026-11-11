@@ -125,6 +125,7 @@ tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
 
 #define PASTA_PENDENTES "/pending"
 #define INTERVALO_SINCRONIZACAO_MS 10000
+#define INTERVALO_RECONEXAO_WIFI_MS 5000
 // Vários frames por POST: com a rede do celular, cada requisição a menos poupa
 // uma ida e volta. O backend aceita até 20 por lote.
 // 3 frames (~50-75 KB): lotes maiores caíam no meio do envio pelo hotspot e
@@ -194,6 +195,7 @@ HTTPClient http;
 bool cartaoDisponivel = false;
 bool avisoCartaoCheioMostrado = false;
 unsigned long ultimaSincronizacaoMs = 0;
+unsigned long ultimaTentativaReconexaoMs = 0;
 bool ultimaSincronizacaoOk = true;
 unsigned long ultimoAquecimentoMs = 0;
 bool conexaoJaAquecida = false;
@@ -523,7 +525,22 @@ void setup() {
 // ==================== LAÇO PRINCIPAL ====================
 
 // O laço não usa delay() longo para o BLE continuar respondendo durante a gravação.
+// O auto-reconnect do ESP32 às vezes não volta depois que o roteador reinicia.
+void reconectarWiFiSeCaiu() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - ultimaTentativaReconexaoMs < INTERVALO_RECONEXAO_WIFI_MS) return;
+
+  ultimaTentativaReconexaoMs = millis();
+  Serial.println("Wi-Fi caiu. Tentando reconectar...");
+  clienteHttps.stop();
+  conexaoJaAquecida = false;
+  WiFi.disconnect();
+  WiFi.begin();
+}
+
 void loop() {
+  reconectarWiFiSeCaiu();
+
   if (fimDeSessaoRecebido) {
     fimDeSessaoRecebido = false;
     agendarAvisoDeFim(sessaoQueTerminou);
