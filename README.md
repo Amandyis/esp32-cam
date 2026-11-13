@@ -11,9 +11,8 @@ para o cartão microSD e são reenviados depois.
 Relógio ──BLE──> ESP32-CAM ──HTTPS──> Backend (/api/captura/*)
 ```
 
-O sketch fica em `esp32cam_gc2145/esp32cam_gc2145.ino`. O nome vem da
-primeira versão, feita para o sensor GC2145; o firmware atual funciona com
-os dois sensores (ver "Sensor e resolução").
+O sketch fica em `esp32cam/esp32cam.ino`. O sensor usado no protótipo é o
+OV2640; o firmware também reconhece o GC2145 (ver "Sensor e resolução").
 
 ## Hardware
 
@@ -75,7 +74,7 @@ câmera.
 
 ## 4. Configurar o firmware
 
-No começo do `esp32cam_gc2145.ino`:
+No começo do `esp32cam.ino`:
 
 | Constante | O que é |
 | --- | --- |
